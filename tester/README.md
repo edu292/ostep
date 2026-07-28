@@ -42,6 +42,3 @@ There is also another script used in testing of `xv6` projects, called
 qemu emulator and runs the relevant testing command in the xv6 environment
 before automatically terminating the test. It is used by the `run-tests.sh`
 script as described above and thus not generally called by users directly.
-
-
-
