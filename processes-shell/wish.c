@@ -8,26 +8,27 @@
 
 #define DEFAULT_CAP_ARGS 8
 
-typedef enum { NAME } ParserState;
+typedef enum { NAME, ARGS } ParserState;
 
 typedef struct {
   size_t length;
   size_t capacity;
   char **data;
-} StringArray;
+} StringVector;
 
 typedef struct {
   char *name;
-  StringArray args;
+  StringVector args;
 } Command;
 
 typedef bool(Handler)(Command);
 
 static char error_message[30] = "An error has occurred\n";
 static char *path_dirs[] = {"/bin", NULL};
+static bool running = true;
 
 bool command_init(Command *c) {
-  c->args.length = 0;
+  c->args.length = 1;
   c->args.capacity = 8;
   c->args.data = malloc(sizeof(char *) * 8);
   if (c->args.data == NULL) {
@@ -37,12 +38,40 @@ bool command_init(Command *c) {
   return true;
 }
 
+void command_reset(Command *c) {
+  c->name = NULL;
+  c->args.length = 1;
+}
+
+void command_destroy(Command c) { free(c.args.data); }
+
+size_t args_length(Command c) { return c.args.length - 1; }
+
+bool command_add_argument(Command *c, char *val) {
+  StringVector *v = &c->args;
+  if (c->args.length == c->args.capacity) {
+    size_t new_cap = v->capacity * 2;
+    char **new_data = realloc(v->data, new_cap);
+    if (new_data == NULL) {
+      perror("Failed to insert");
+      return false;
+    }
+    v->data = new_data;
+    v->capacity = new_cap;
+  }
+
+  v->data[v->length++] = val;
+
+  return true;
+}
+
 bool exit_handler(Command c) {
-  if (c.args.length != 0) {
+  if (args_length(c) != 1) {
     return false;
   }
 
-  exit(0);
+  running = false;
+  return true;
 }
 
 bool resolve_path(const char *name, char **full_path) {
@@ -84,10 +113,11 @@ bool exec_handler(Command c) {
     return false;
   case 0:
     execv(c.name, c.args.data);
-    perror("failed to exec");
+    perror("exec failed");
     return false;
   default:
     wait(NULL);
+    free(c.name);
     return true;
   }
 }
@@ -100,48 +130,61 @@ bool get_handler(Command *c, Handler **out) {
     if (!resolve_path(c->name, &full_path)) {
       return false;
     }
+
     c->name = full_path;
-    c->args.data[0] = full_path;
     *out = exec_handler;
   }
+  c->args.data[0] = c->name;
+  command_add_argument(c, NULL);
 
   return true;
 }
 
 int main(int argc, char *argv[]) {
-  char *line;
-  size_t line_size = 0;
+  char *line_buf = NULL;
+  size_t line_buf_size;
 
-  printf("wish> ");
   size_t read;
-  while ((read = getline(&line, &line_size, stdin)) > 0) {
-    line[read - 1] = '\0';
-    char *token;
-    ParserState state = NAME;
-    Command current;
-    if (!command_init(&current)) {
-      return 1;
-    }
+  Command com;
+  if (!command_init(&com)) {
+    return 1;
+  }
 
-    while ((token = strsep(&line, " ")) != NULL) {
-      switch (state) {
+  goto prompt;
+  while ((read = getline(&line_buf, &line_buf_size, stdin)) > 1) {
+    line_buf[read - 1] = '\0';
+    char *token;
+    ParserState parser = NAME;
+
+    while ((token = strsep(&line_buf, " ")) != NULL) {
+      switch (parser) {
       case NAME:
-        current.name = token;
+        com.name = token;
+        parser = ARGS;
         break;
+      case ARGS:
+        command_add_argument(&com, token);
       }
     }
 
     Handler *handler;
-    if (!get_handler(&current, &handler)) {
+    if (!get_handler(&com, &handler)) {
       write(STDERR_FILENO, error_message, strlen(error_message));
-    }
-
-    if (!handler(current)) {
+    } else if (!handler(com)) {
       write(STDERR_FILENO, error_message, strlen(error_message));
     };
 
+    command_reset(&com);
+    if (!running) {
+      break;
+    }
+
+  prompt:
     printf("wish> ");
   }
+
+  free(line_buf);
+  command_destroy(com);
 
   return 0;
 }
