@@ -6,7 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define DEFAULT_CAP_ARGS 8
+#define DEFAULT_CAP_VEC 8
 
 typedef enum { NAME, ARGS } ParserState;
 
@@ -24,49 +24,64 @@ typedef struct {
 typedef bool(Handler)(Command);
 
 static char error_message[30] = "An error has occurred\n";
-static char *path_dirs[] = {"/bin", NULL};
+static StringVector *path_dirs;
 static bool running = true;
 
-bool command_init(Command *c) {
-  c->args.length = 1;
-  c->args.capacity = 8;
-  c->args.data = malloc(sizeof(char *) * 8);
-  if (c->args.data == NULL) {
+bool vector_init(StringVector *v) {
+  v->length = 0;
+  v->capacity = DEFAULT_CAP_VEC;
+  v->data = malloc(sizeof(char *) * DEFAULT_CAP_VEC);
+  if (v->data == NULL) {
     return false;
   }
 
   return true;
 }
 
-void command_reset(Command *c) {
-  c->name = NULL;
-  c->args.length = 1;
+void vector_clear(StringVector *v) {
+  for (size_t i = 0; i < v->length; i++) {
+    free(v->data[i]);
+  }
+
+  v->length = 0;
 }
 
-void command_destroy(Command c) { free(c.args.data); }
+void vector_destroy(StringVector *v) {
+  if (v != NULL) {
+    vector_clear(v);
+    free(v->data);
+  }
+}
 
-size_t args_length(Command c) { return c.args.length - 1; }
-
-bool command_add_argument(Command *c, char *val) {
-  StringVector *v = &c->args;
-  if (c->args.length == c->args.capacity) {
+bool vector_append(StringVector *v, char *val) {
+  if (v->length == v->capacity) {
     size_t new_cap = v->capacity * 2;
     char **new_data = realloc(v->data, new_cap);
     if (new_data == NULL) {
-      perror("Failed to insert");
+      perror("failed to insert");
       return false;
     }
     v->data = new_data;
     v->capacity = new_cap;
   }
 
-  v->data[v->length++] = val;
+  v->data[v->length++] = val != NULL ? strdup(val) : NULL;
 
   return true;
 }
 
+bool vector_insert(StringVector *v, char *val, size_t idx) {
+  if (idx >= v->length) {
+    return false;
+  }
+
+  free(v->data[idx]);
+  v->data[idx] = val != NULL ? strdup(val) : NULL;
+  return true;
+}
+
 bool exit_handler(Command c) {
-  if (args_length(c) != 1) {
+  if (c.args.length != 1) {
     return false;
   }
 
@@ -74,14 +89,35 @@ bool exit_handler(Command c) {
   return true;
 }
 
+bool path_handler(Command c) {
+  vector_clear(path_dirs);
+  for (size_t i = 1; i < c.args.length; i++) {
+    if (!vector_append(path_dirs, c.args.data[i])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool cd_handler(Command c) {
+  if (c.args.length != 2) {
+    return false;
+  }
+
+  if (chdir(c.args.data[1]) != 0) {
+    return false;
+  }
+
+  return true;
+}
+
 bool resolve_path(const char *name, char **full_path) {
   size_t base_len = strlen(name) + 2;
   size_t cap = 128;
   char *candidate = malloc(cap);
-  size_t i = 0;
-  char *dir = "";
-  while (dir != NULL) {
-    dir = path_dirs[i];
+  for (size_t i = 0; i < path_dirs->length; i++) {
+    char *dir = path_dirs->data[i];
     size_t len = base_len + strlen(dir);
     if (len > cap) {
       cap = len;
@@ -106,47 +142,52 @@ bool resolve_path(const char *name, char **full_path) {
 }
 
 bool exec_handler(Command c) {
+  char *full_path;
+  if (!resolve_path(c.name, &full_path)) {
+    return false;
+  }
+
   int pid = fork();
   switch (pid) {
   case -1:
-    perror("fork failed");
     return false;
   case 0:
-    execv(c.name, c.args.data);
-    perror("exec failed");
+    vector_insert(&c.args, full_path, 0);
+    vector_append(&c.args, NULL);
+    execv(full_path, c.args.data);
     return false;
   default:
     wait(NULL);
-    free(c.name);
+    free(full_path);
     return true;
   }
 }
 
-bool get_handler(Command *c, Handler **out) {
+Handler *get_handler(Command *c) {
   if (strcmp(c->name, "exit") == 0) {
-    *out = exit_handler;
+    return exit_handler;
+  } else if (strcmp(c->name, "path") == 0) {
+    return path_handler;
+  } else if (strcmp(c->name, "cd") == 0) {
+    return cd_handler;
   } else {
-    char *full_path;
-    if (!resolve_path(c->name, &full_path)) {
-      return false;
-    }
-
-    c->name = full_path;
-    *out = exec_handler;
+    return exec_handler;
   }
-  c->args.data[0] = c->name;
-  command_add_argument(c, NULL);
-
-  return true;
 }
 
 int main(int argc, char *argv[]) {
   char *line_buf = NULL;
   size_t line_buf_size;
+  path_dirs = malloc(sizeof(StringVector));
+  if (!vector_init(path_dirs)) {
+    return 1;
+  }
+
+  vector_append(path_dirs, "/bin");
 
   size_t read;
   Command com;
-  if (!command_init(&com)) {
+  if (!vector_init(&com.args)) {
     return 1;
   }
 
@@ -156,25 +197,29 @@ int main(int argc, char *argv[]) {
     char *token;
     ParserState parser = NAME;
 
-    while ((token = strsep(&line_buf, " ")) != NULL) {
+    char *line_pos = line_buf;
+    while ((token = strsep(&line_buf, " \t")) != NULL) {
+      if (*token == '\0') {
+        continue;
+      }
+
       switch (parser) {
       case NAME:
         com.name = token;
+        vector_append(&com.args, token);
         parser = ARGS;
         break;
       case ARGS:
-        command_add_argument(&com, token);
+        vector_append(&com.args, token);
       }
     }
 
-    Handler *handler;
-    if (!get_handler(&com, &handler)) {
-      write(STDERR_FILENO, error_message, strlen(error_message));
-    } else if (!handler(com)) {
+    Handler *handler = get_handler(&com);
+    if (!handler(com)) {
       write(STDERR_FILENO, error_message, strlen(error_message));
     };
 
-    command_reset(&com);
+    vector_clear(&com.args);
     if (!running) {
       break;
     }
@@ -184,7 +229,9 @@ int main(int argc, char *argv[]) {
   }
 
   free(line_buf);
-  command_destroy(com);
+  vector_destroy(&com.args);
+  vector_destroy(path_dirs);
+  free(path_dirs);
 
   return 0;
 }
