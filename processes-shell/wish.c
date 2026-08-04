@@ -231,18 +231,18 @@ ParseCode command_parse(char **buf_ptr, Command *out) {
 
   ParserState state = UNITIALIZED;
   char *token = NULL;
-  while (state != FINISHED && (token = strsep(buf_ptr, " \t\n")) != NULL) {
+  while ((token = strsep(buf_ptr, " \t\n")) != NULL) {
     if (*token == '\0') {
       continue;
     }
 
-    if (state == UNITIALIZED) {
-      state = NAME;
-    }
-    ParseOpResult r = {};
+    ParseOpResult r = operator_parse(token);
+    ;
     switch (state) {
+    case UNITIALIZED:
+      state = NAME;
+      [[fallthrough]];
     case NAME:
-      r = operator_parse(token);
       if (r.found_operator) {
         if (!r.has_prefix) {
           return INVALID;
@@ -257,7 +257,6 @@ ParseCode command_parse(char **buf_ptr, Command *out) {
       vector_append(&out->args, token);
       break;
     case ARGS:
-      r = operator_parse(token);
       if (r.found_operator) {
         commit_operator(r.op, buf_ptr, out, &state);
 
@@ -271,18 +270,32 @@ ParseCode command_parse(char **buf_ptr, Command *out) {
     case REDIRECT:
       out->redirect = token;
       state = FINISHED;
+      break;
+    case FINISHED:
+      if (r.found_operator && !r.has_prefix) {
+        commit_operator(r.op, buf_ptr, out, &state);
+      } else {
+        if (*buf_ptr != NULL) {
+          *(*buf_ptr - 1) = ' ';
+        }
+
+        *buf_ptr = token;
+      }
+
+      goto finished;
     }
   }
 
-  if (state == UNITIALIZED) {
+finished:
+  switch (state) {
+  case UNITIALIZED:
     return END;
-  }
-
-  if (state == REDIRECT || state == NAME) {
+  case REDIRECT:
+  case NAME:
     return INVALID;
+  default:
+    return OK;
   }
-
-  return OK;
 }
 
 int main(int argc, char *argv[]) {
