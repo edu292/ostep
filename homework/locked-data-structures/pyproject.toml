@@ -1,0 +1,12 @@
+[project]
+name = "locked-data-structures"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "edu292", email = "eduskoroboatei@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.1",
+]
