@@ -50,25 +50,32 @@ int process_job(void *j) {
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
+    fprintf(stderr, "pzip: file1 [file2 ...]\n");
     return 1;
   }
 
   size_t thread_count = (size_t)get_nprocs();
   thrd_t threads[thread_count];
+  Run last_run = {};
+  bool first_file = true;
   for (int file_index = 1; file_index < argc; file_index++) {
     int fd = open(argv[file_index], O_RDONLY);
     if (fd == -1) {
-      perror("");
+      fprintf(stderr, "pzip: cannot open file\n");
       return 1;
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
-      perror("");
       return 1;
     }
 
     size_t file_size = (size_t)st.st_size;
+    if (file_size == 0) {
+      close(fd);
+      continue;
+    }
+
     char *file = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (file == MAP_FAILED) {
       perror("");
@@ -102,18 +109,22 @@ int main(int argc, char *argv[]) {
       }
     };
 
-    Run *last_run = NULL;
     job_cursor = job_arena;
     for (size_t i = 0; i < thread_count; i++) {
       thrd_join(threads[i], NULL);
       Job *job = (Job *)job_cursor;
 
-      if (last_run != NULL) {
+      if (job->run_count == 0) {
+        job_cursor += (job->length * sizeof(Run)) + sizeof(Job);
+        continue;
+      }
+
+      if (!first_file) {
         Run *first_run = &job->dest[0];
-        if (first_run->character == last_run->character) {
-          first_run->length += last_run->length;
+        if (first_run->character == last_run.character) {
+          first_run->length += last_run.length;
         } else {
-          fwrite(last_run, sizeof(Run), 1, stdout);
+          fwrite(&last_run, sizeof(Run), 1, stdout);
         }
       }
 
@@ -121,13 +132,17 @@ int main(int argc, char *argv[]) {
         fwrite(&job->dest[0], sizeof(Run), job->run_count - 1, stdout);
       }
 
-      last_run = &job->dest[job->run_count - 1];
+      memcpy(&last_run, &job->dest[job->run_count - 1], sizeof(Run));
+      first_file = false;
       job_cursor += (job->length * sizeof(Run)) + sizeof(Job);
     }
-    fwrite(last_run, sizeof(Run), 1, stdout);
 
     munmap(job_arena, arena_size);
     munmap(file, file_size);
     close(fd);
+  }
+
+  if (!first_file) {
+    fwrite(&last_run, sizeof(Run), 1, stdout);
   }
 }
