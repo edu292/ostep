@@ -33,6 +33,14 @@ float comp_size=$(wc -c < bench.wzip)
 float comp_ratio=$((orig_size / comp_size))
 float space_saved=$(((1.0 - (comp_size / orig_size)) * 100.0))
 
+# Calculate sizes and floating-point metrics
+float orig_size=$(wc -c < bench.in)
+float comp_size=$(wc -c < bench.wzip)
+((comp_size <= 0)) && comp_size=1
+
+float comp_ratio=$((orig_size / comp_size))
+float space_saved=$(((1.0 - (comp_size / orig_size)) * 100.0))
+
 float w=$wzip_t
 float p=$pzip_t
 ((p <= 0)) && p=0.001
