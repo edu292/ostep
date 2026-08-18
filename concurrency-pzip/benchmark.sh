@@ -3,71 +3,67 @@
 zmodload zsh/datetime
 
 WZIP="../initial-utilities/wzip/wzip"
+PZIP="./pzip"
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-PAYLOAD_MB=512
-
-echo "=> Preparing ${PAYLOAD_MB}MB benchmark payload..."
-yes "aaaaabbbbbcccccdddddeeeee" | head -c "${PAYLOAD_MB}M" >bench.in
-
-echo "=> Benchmarking Reference wzip..."
-start=$EPOCHREALTIME
-"$WZIP" bench.in >bench.wzip
-wzip_t=$((EPOCHREALTIME - start))
-
-echo "=> Benchmarking pzip..."
-start=$EPOCHREALTIME
-./pzip bench.in >bench.pzip
-pzip_t=$((EPOCHREALTIME - start))
-
-if ! cmp -s bench.wzip bench.pzip; then
-    echo "ERROR: pzip output does not match wzip on benchmark payload!"
-    rm -f bench.in bench.wzip bench.pzip
-    exit 1
-fi
-
-# Calculate sizes and floating-point metrics
-float orig_size=$(wc -c < bench.in)
-float comp_size=$(wc -c < bench.wzip)
-((comp_size <= 0)) && comp_size=1
-
-float comp_ratio=$((orig_size / comp_size))
-float space_saved=$(((1.0 - (comp_size / orig_size)) * 100.0))
-
-float w=$wzip_t
-float p=$pzip_t
-((p <= 0)) && p=0.001
-((w <= 0)) && w=0.001
-
-float speedup=$((w / p))
-float efficiency=$(((speedup / CORES) * 100))
-float p_throughput=$((PAYLOAD_MB / p))
-float w_throughput=$((PAYLOAD_MB / w))
-
-print "------------------------------------------------"
 printf "CPU Cores Detected:  %d\n" $CORES
-printf "Sequential wzip:     %.3fs (%.1f MB/s)\n" $w $w_throughput
-printf "Parallel pzip:       %.3fs (%.1f MB/s)\n" $p $p_throughput
-printf "Speedup Factor:      %.2fx\n" $speedup
-printf "Parallel Efficiency: %.1f%%\n" $efficiency
-printf "Compression Ratio:   %.2f:1 (%.1f%% space saved)\n" $comp_ratio $space_saved
-print "------------------------------------------------"
 
-if ((CORES == 1)); then
-    if ((speedup >= 0.85)); then
-        print "Grade: A (Optimal single-thread performance)"
-    else
-        print "Grade: C (High thread/synchronization overhead on 1 core)"
-    fi
-else
-    if ((efficiency >= 65)); then
-        print "Grade: A+ (Outstanding scaling - near-linear speedup)"
-    elif ((efficiency >= 45)); then
-        print "Grade: A  (Good scaling - effective thread utilization)"
-    elif ((speedup >= 1.1)); then
-        print "Grade: B  (Faster than sequential, but high thread contention/overhead)"
-    else
-        print "Grade: C  (Slower or equal to sequential - thread synchronization bottleneck)"
-    fi
-fi
+run_benchmark() {
+    local title=$1
+    local payload_file=$2
+    local payload_mb=$3
 
-rm -f bench.in bench.wzip bench.pzip
+    print "\n========================================================"
+    print "=> Test Case: $title (${payload_mb}MB)"
+    print "========================================================"
+
+    local start=$EPOCHREALTIME
+    "$WZIP" "$payload_file" > bench.wzip
+    local wzip_t=$((EPOCHREALTIME - start))
+
+    start=$EPOCHREALTIME
+    "$PZIP" "$payload_file" > bench.pzip
+    local pzip_t=$((EPOCHREALTIME - start))
+
+    if ! cmp -s bench.wzip bench.pzip; then
+        print -u2 "ERROR: pzip output does not match wzip for $title!"
+        rm -f bench.wzip bench.pzip "$payload_file"
+        exit 1
+    fi
+
+    float orig_size=$(wc -c < "$payload_file")
+    float comp_size=$(wc -c < bench.wzip)
+    ((comp_size <= 0)) && comp_size=1
+
+    float comp_ratio=$((orig_size / comp_size))
+    float space_saved=$(((1.0 - (comp_size / orig_size)) * 100.0))
+
+    float w=$wzip_t
+    float p=$pzip_t
+    ((p <= 0)) && p=0.001
+    ((w <= 0)) && w=0.001
+
+    float speedup=$((w / p))
+    float efficiency=$(((speedup / CORES) * 100))
+    float p_throughput=$((payload_mb / p))
+    float w_throughput=$((payload_mb / w))
+
+    printf "Sequential wzip:     %.3fs (%.1f MB/s)\n" $w $w_throughput
+    printf "Parallel pzip:       %.3fs (%.1f MB/s)\n" $p $p_throughput
+    printf "Speedup Factor:      %.2fx\n" $speedup
+    printf "Parallel Efficiency: %.1f%%\n" $efficiency
+    printf "Compression Ratio:   %.2f:1 (%.1f%% space saved)\n" $comp_ratio $space_saved
+
+    rm -f bench.wzip bench.pzip
+}
+
+yes "aaaaabbbbbcccccdddddeeeee" | head -c 512M > bench_mixed.in
+run_benchmark "Standard Mixed Pattern" bench_mixed.in 512
+rm -f bench_mixed.in
+
+head -c 512M < /dev/zero | tr '\0' 'a' > bench_max.in
+run_benchmark "Max Compression" bench_max.in 512
+rm -f bench_max.in
+
+head -c 64M < /dev/urandom > bench_worst.in
+run_benchmark "Worst Case" bench_worst.in 64
+rm -f bench_worst.in

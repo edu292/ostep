@@ -92,8 +92,8 @@ void process_chunk(Chunk *chunk) {
   chunk->run_count = 0;
 
   Run run = {.length = 1, .character = *chunk->raw};
-  for (char *current_ptr = chunk->raw + 1; current_ptr <= end; current_ptr++) {
-    char current_char = current_ptr < end ? *current_ptr : '\0';
+  for (char *current_ptr = chunk->raw + 1; current_ptr < end; current_ptr++) {
+    char current_char = *current_ptr;
     if (current_char == run.character) {
       run.length++;
       continue;
@@ -106,6 +106,9 @@ void process_chunk(Chunk *chunk) {
     run.character = current_char;
     run.length = 1;
   }
+
+  *runs_ptr++ = run;
+  chunk->run_count++;
 }
 
 int worker(void *c) {
