@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,7 +27,7 @@ typedef struct {
   mtx_t lock;
   size_t raw_len;
   size_t run_count;
-  ChunkState state;
+  _Atomic ChunkState state;
   char raw[CHUNK_SIZE];
   Run runs[CHUNK_SIZE];
 } Chunk;
@@ -88,6 +89,7 @@ size_t reader_read_chunk(Reader *r, char *buf) {
 void process_chunk(Chunk *chunk) {
   char *end = chunk->raw + chunk->raw_len;
   Run *runs_ptr = chunk->runs;
+  chunk->run_count = 0;
 
   Run run = {.length = 1, .character = *chunk->raw};
   for (char *current_ptr = chunk->raw + 1; current_ptr <= end; current_ptr++) {
@@ -111,16 +113,21 @@ int worker(void *c) {
   size_t used_chunks = 0;
   while (used_chunks != context->count) {
     for (size_t i = 0; i < context->count; i++) {
+      ChunkState expected = CHUNK_READY;
       Chunk *chunk = &context->chunks[i];
-      mtx_lock(&chunk->lock);
-      if (chunk->state == CHUNK_READY) {
+      bool available = atomic_compare_exchange_strong(&chunk->state, &expected,
+                                                      CHUNK_WORKING);
+      if (available) {
+        used_chunks = 0;
+
+        mtx_lock(&chunk->lock);
         process_chunk(chunk);
         chunk->state = CHUNK_DONE;
-        used_chunks = 0;
+        cnd_broadcast(&chunk->done);
+        mtx_unlock(&chunk->lock);
       } else {
         used_chunks++;
       }
-      mtx_unlock(&chunk->lock);
     }
   }
 
@@ -188,16 +195,16 @@ int main(int argc, char *argv[]) {
         cnd_wait(&chunk->done, &chunk->lock);
       }
 
-      if (chunk->run_count > 1) {
-        if (!first_chunk) {
-          Run *first_run = &chunk->runs[0];
-          if (first_run->character == last_run.character) {
-            first_run->length += last_run.length;
-          } else {
-            fwrite(&last_run, sizeof(Run), 1, stdout);
-          }
+      if (!first_chunk) {
+        Run *first_run = &chunk->runs[0];
+        if (first_run->character == last_run.character) {
+          first_run->length += last_run.length;
+        } else {
+          fwrite(&last_run, sizeof(Run), 1, stdout);
         }
+      }
 
+      if (chunk->run_count > 1) {
         fwrite(&chunk->runs[0], sizeof(Run), chunk->run_count - 1, stdout);
       }
 
