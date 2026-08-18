@@ -100,3 +100,28 @@ echo "y" >tests/15b.in
 echo "z" >tests/15c.in
 $WZIP tests/15a.in tests/15b.in tests/15c.in >tests/15.out
 gen_test 15 "Many files" "tests/15a.in tests/15b.in tests/15c.in" 0 ""
+
+head -c 2097152 </dev/zero | tr '\0' 'a' >tests/16.in
+$WZIP tests/16.in >tests/16.out
+gen_test 16 "2MB single-char merge across 1MB boundary" "tests/16.in" 0 ""
+
+# T17: 2MB with boundary-crossing pattern (Tests exact split at 1MB offset)
+# 1MB - 2 bytes of 'a', then 4 bytes of 'b' spanning the 1MB mark, then 'c'
+python3 -c "import sys; sys.stdout.buffer.write(b'a'*(1048576 - 2) + b'b'*4 + b'c'*(1048576 - 2))" >tests/17.in
+$WZIP tests/17.in >tests/17.out
+gen_test 17 "2MB boundary split in middle of character run" "tests/17.in" 0 ""
+
+# T18: Exactly 1MB file (Tests exact chunk boundary edge case)
+head -c 1048576 </dev/zero | tr '\0' 'x' >tests/18.in
+$WZIP tests/18.in >tests/18.out
+gen_test 18 "Exactly 1MB single chunk" "tests/18.in" 0 ""
+
+# T19: 1MB + 1 byte (Tests tiny remainder chunk handling)
+python3 -c "import sys; sys.stdout.buffer.write(b'a'*1048576 + b'b')" >tests/19.in
+$WZIP tests/19.in >tests/19.out
+gen_test 19 "1MB plus 1 byte remainder" "tests/19.in" 0 ""
+
+# T20: 32MB payload (Tests ring buffer wrapping & multi-threaded chunk reordering)
+python3 -c "import sys; sys.stdout.buffer.write(b'aaaaabbbbbcccccdddddeeeee' * ((32 * 1024 * 1024) // 25))" >tests/20.in
+$WZIP tests/20.in >tests/20.out
+gen_test 20 "32MB benchmark mini-payload" "tests/20.in" 0 ""
