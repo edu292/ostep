@@ -19,19 +19,11 @@ start=$EPOCHREALTIME
 ./pzip bench.in >bench.pzip
 pzip_t=$((EPOCHREALTIME - start))
 
-#if ! cmp -s bench.wzip bench.pzip; then
-#    echo "ERROR: pzip output does not match wzip on benchmark payload!"
-#    rm -f bench.in bench.wzip bench.pzip
-#    exit 1
-#fi
-
-# Calculate sizes and floating-point metrics
-float orig_size=$(wc -c < bench.in)
-float comp_size=$(wc -c < bench.wzip)
-((comp_size <= 0)) && comp_size=1
-
-float comp_ratio=$((orig_size / comp_size))
-float space_saved=$(((1.0 - (comp_size / orig_size)) * 100.0))
+if ! cmp -s bench.wzip bench.pzip; then
+    echo "ERROR: pzip output does not match wzip on benchmark payload!"
+    rm -f bench.in bench.wzip bench.pzip
+    exit 1
+fi
 
 # Calculate sizes and floating-point metrics
 float orig_size=$(wc -c < bench.in)
