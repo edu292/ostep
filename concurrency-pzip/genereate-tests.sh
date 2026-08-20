@@ -3,10 +3,8 @@
 
 WZIP="../initial-utilities/wzip/wzip"
 
-echo "=> Generating 15 test cases using reference wzip..."
 mkdir -p tests
 
-# Helper function to generate test case scaffolding
 gen_test() {
     local n=$1
     local desc=$2

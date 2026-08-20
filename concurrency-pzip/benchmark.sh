@@ -1,6 +1,7 @@
 #!/bin/env zsh
 
 zmodload zsh/datetime
+zmodload zsh/stat
 
 WZIP="../initial-utilities/wzip/wzip"
 PZIP="./pzip"
@@ -30,8 +31,8 @@ run_benchmark() {
         exit 1
     fi
 
-    float orig_size=$(wc -c < "$payload_file")
-    float comp_size=$(wc -c < bench.wzip)
+    float orig_size=$(zstat +size "$payload_file")
+    float comp_size=$(zstat +size bench.wzip)
     ((comp_size <= 0)) && comp_size=1
 
     float comp_ratio=$((orig_size / comp_size))
@@ -56,14 +57,17 @@ run_benchmark() {
     rm -f bench.wzip bench.pzip
 }
 
-yes "aaaaabbbbbcccccdddddeeeee" | head -c 512M > bench_mixed.in
+if [[ ! -f bench_mixed.in ]]; then
+    yes "aaaaabbbbbcccccdddddeeeee" | head -c 512M > bench_mixed.in
+fi
 run_benchmark "Standard Mixed Pattern" bench_mixed.in 512
-rm -f bench_mixed.in
 
-head -c 512M < /dev/zero | tr '\0' 'a' > bench_max.in
+if [[ ! -f bench_max.in ]]; then
+    head -c 512M < /dev/zero | tr '\0' 'a' > bench_max.in
+fi
 run_benchmark "Max Compression" bench_max.in 512
-rm -f bench_max.in
 
-head -c 64M < /dev/urandom > bench_worst.in
+if [[ ! -f bench_worst.in ]]; then
+    head -c 64M < /dev/urandom > bench_worst.in
+fi
 run_benchmark "Worst Case" bench_worst.in 64
-rm -f bench_worst.in

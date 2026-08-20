@@ -11,7 +11,13 @@
 #include <threads.h>
 #include <unistd.h>
 
-#define CHUNK_SIZE (1024UL * 1024UL)
+#ifndef CHUNK_SIZE
+#define CHUNK_SIZE (512UL * 1024UL)
+#endif
+
+#ifndef CHUNK_FACTOR
+#define CHUNK_FACTOR (2)
+#endif
 
 #pragma pack(push, 1)
 typedef struct {
@@ -34,8 +40,9 @@ typedef struct {
 
 typedef struct {
   size_t count;
+  bool filling;
   Chunk chunks[];
-} Context;
+} ChunkArena;
 
 typedef struct {
   char **filepaths;
@@ -69,6 +76,7 @@ size_t reader_read_chunk(Reader *r, char *buf) {
       }
 
       r->fd = open(r->filepaths[0], O_RDONLY);
+      // posix_fadvise(r->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
       r->filepaths++;
       r->count--;
     }
@@ -86,6 +94,26 @@ size_t reader_read_chunk(Reader *r, char *buf) {
   return total_read;
 }
 
+void chunk_arena_init(ChunkArena *arena, size_t count, Reader *reader) {
+  arena->filling = true;
+  arena->count = count;
+
+  for (size_t i = 0; i < count; i++) {
+    Chunk *chunk = &arena->chunks[i];
+    mtx_init(&chunk->lock, mtx_plain);
+    cnd_init(&chunk->done);
+
+    size_t n = reader_read_chunk(reader, chunk->raw);
+    if (n > 0) {
+      chunk->raw_len = n;
+      chunk->state = CHUNK_READY;
+    } else {
+      chunk->state = CHUNK_EMPTY;
+      arena->filling = false;
+    }
+  }
+}
+
 void process_chunk(Chunk *chunk) {
   char *end = chunk->raw + chunk->raw_len;
   Run *runs_ptr = chunk->runs;
@@ -99,10 +127,9 @@ void process_chunk(Chunk *chunk) {
       continue;
     }
 
-    memcpy(runs_ptr, &run, sizeof(Run));
-    runs_ptr++;
-
+    *runs_ptr++ = run;
     chunk->run_count++;
+
     run.character = current_char;
     run.length = 1;
   }
@@ -111,45 +138,37 @@ void process_chunk(Chunk *chunk) {
   chunk->run_count++;
 }
 
-int worker(void *c) {
-  Context *context = (Context *)c;
+int worker(void *a) {
+  ChunkArena *arena = (ChunkArena *)a;
   size_t used_chunks = 0;
-  while (used_chunks != context->count) {
-    for (size_t i = 0; i < context->count; i++) {
-      ChunkState expected = CHUNK_READY;
-      Chunk *chunk = &context->chunks[i];
-      bool available = atomic_compare_exchange_strong(&chunk->state, &expected,
-                                                      CHUNK_WORKING);
-      if (available) {
-        used_chunks = 0;
+  size_t i = 0;
+  while (true) {
+    Chunk *chunk = &arena->chunks[i];
+    ChunkState expected = CHUNK_READY;
+    bool available =
+        atomic_compare_exchange_strong(&chunk->state, &expected, CHUNK_WORKING);
+    if (available) {
+      used_chunks = 0;
 
-        mtx_lock(&chunk->lock);
-        process_chunk(chunk);
-        chunk->state = CHUNK_DONE;
-        cnd_broadcast(&chunk->done);
-        mtx_unlock(&chunk->lock);
-      } else {
-        used_chunks++;
+      process_chunk(chunk);
+      chunk->state = CHUNK_DONE;
+      mtx_lock(&chunk->lock);
+
+      cnd_broadcast(&chunk->done);
+      mtx_unlock(&chunk->lock);
+    } else {
+      used_chunks++;
+      if (used_chunks == arena->count) {
+        if (!arena->filling) {
+          return 0;
+        }
+
+        used_chunks = 0;
+        thrd_yield();
       }
     }
-  }
 
-  return 0;
-}
-
-void work_ring_init(Context *w, Reader *reader) {
-  for (size_t i = 0; i < w->count; i++) {
-    Chunk *chunk = &w->chunks[i];
-    mtx_init(&chunk->lock, mtx_plain);
-    cnd_init(&chunk->done);
-
-    size_t n = reader_read_chunk(reader, chunk->raw);
-    if (n > 0) {
-      chunk->raw_len = n;
-      chunk->state = CHUNK_READY;
-    } else {
-      chunk->state = CHUNK_EMPTY;
-    }
+    i = i + 1 < arena->count ? i + 1 : 0;
   }
 }
 
@@ -160,72 +179,79 @@ int main(int argc, char *argv[]) {
   }
 
   size_t thread_count = (size_t)get_nprocs();
-  size_t chunk_count = 2 * thread_count;
+  size_t chunk_count = CHUNK_FACTOR * thread_count;
   Reader reader;
   if (!reader_init(&reader, &argv[1], (size_t)(argc - 1))) {
     fprintf(stderr, "pzip: cannot open file\n");
     return 1;
   };
 
-  Context *work_ring =
-      mmap(NULL, sizeof(Context) + (chunk_count * sizeof(Chunk)),
+  ChunkArena *chunk_arena =
+      mmap(NULL, sizeof(ChunkArena) + (chunk_count * sizeof(Chunk)),
            PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (work_ring == MAP_FAILED) {
-    return 1;
-  }
-  work_ring->count = chunk_count;
-
-  work_ring_init(work_ring, &reader);
+  chunk_arena_init(chunk_arena, chunk_count, &reader);
 
   thrd_t threads[thread_count];
   for (size_t i = 0; i < thread_count; i++) {
-    thrd_create(&threads[i], worker, work_ring);
+    thrd_create(&threads[i], worker, chunk_arena);
   }
 
   Run last_run = {};
   bool first_chunk = true;
-  bool running = true;
-  while (running) {
-    for (size_t index = 0; index < work_ring->count; index++) {
-      Chunk *chunk = &work_ring->chunks[index];
-      if (chunk->state == CHUNK_EMPTY) {
-        running = false;
-        break;
-      }
+  size_t i = 0;
+  while (true) {
+    Chunk *chunk = &chunk_arena->chunks[i];
+    if (chunk->state == CHUNK_EMPTY) {
+      break;
+    }
 
-      mtx_lock(&chunk->lock);
-      while (chunk->state != CHUNK_DONE) {
-        cnd_wait(&chunk->done, &chunk->lock);
-      }
+    mtx_lock(&chunk->lock);
+    while (chunk->state != CHUNK_DONE) {
+      cnd_wait(&chunk->done, &chunk->lock);
+    }
+    mtx_unlock(&chunk->lock);
 
-      if (!first_chunk) {
-        Run *first_run = &chunk->runs[0];
-        if (first_run->character == last_run.character) {
-          first_run->length += last_run.length;
-        } else {
-          fwrite(&last_run, sizeof(Run), 1, stdout);
-        }
+    if (!first_chunk) {
+      Run *first_run = &chunk->runs[0];
+      if (first_run->character == last_run.character) {
+        first_run->length += last_run.length;
+      } else {
+        fwrite(&last_run, sizeof(Run), 1, stdout);
       }
+    }
 
-      if (chunk->run_count > 1) {
-        fwrite(&chunk->runs[0], sizeof(Run), chunk->run_count - 1, stdout);
-      }
+    if (chunk->run_count > 1) {
+      fwrite(&chunk->runs[0], sizeof(Run), chunk->run_count - 1, stdout);
+    }
 
-      memcpy(&last_run, &chunk->runs[chunk->run_count - 1], sizeof(Run));
-      first_chunk = false;
+    first_chunk = false;
+    memcpy(&last_run, &chunk->runs[chunk->run_count - 1], sizeof(Run));
+    if (chunk_arena->filling) {
       size_t n = reader_read_chunk(&reader, chunk->raw);
-      if (n > 0) {
+      if (n == 0) {
+        chunk->state = CHUNK_EMPTY;
+      } else {
         chunk->raw_len = n;
         chunk->state = CHUNK_READY;
-      } else {
-        chunk->state = CHUNK_EMPTY;
       }
 
-      mtx_unlock(&chunk->lock);
+      if (n < CHUNK_SIZE) {
+        chunk_arena->filling = false;
+      }
+    } else {
+      chunk->state = CHUNK_EMPTY;
     }
+
+    i = i + 1 < chunk_arena->count ? i + 1 : 0;
   }
 
   if (!first_chunk) {
     fwrite(&last_run, sizeof(Run), 1, stdout);
   }
+
+  for (size_t t = 0; t < thread_count; t++) {
+    thrd_join(threads[t], NULL);
+  }
+
+  munmap(chunk_arena, sizeof(ChunkArena) + (chunk_count * sizeof(Chunk)));
 }
