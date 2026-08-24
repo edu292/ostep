@@ -11,13 +11,8 @@
 #include <threads.h>
 #include <unistd.h>
 
-#ifndef CHUNK_SIZE
-#define CHUNK_SIZE (512UL * 1024UL)
-#endif
-
-#ifndef CHUNK_FACTOR
-#define CHUNK_FACTOR (2)
-#endif
+constexpr size_t CHUNK_SIZE = 512UL * 1024UL;
+constexpr size_t CHUNK_FACTOR = 2;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -26,101 +21,165 @@ typedef struct {
 } Run;
 #pragma pack(pop)
 
-typedef enum { CHUNK_EMPTY, CHUNK_READY, CHUNK_WORKING, CHUNK_DONE } ChunkState;
-
 typedef struct {
-  cnd_t done;
+  cnd_t done_cnd;
   mtx_t lock;
-  size_t raw_len;
+  char *data;
+  size_t data_len;
   size_t run_count;
-  _Atomic ChunkState state;
-  char raw[CHUNK_SIZE];
+  bool done;
   Run runs[CHUNK_SIZE];
 } Chunk;
 
-typedef struct {
-  size_t count;
-  bool filling;
-  Chunk chunks[];
-} ChunkArena;
+void chunk_set(Chunk *c, char *data, size_t data_len) {
+  c->data_len = data_len;
+  c->run_count = 0;
+  c->data = data;
+  c->done = false;
+}
 
 typedef struct {
+  cnd_t empty;
+  cnd_t full;
+  mtx_t lock;
+  size_t capacity;
+  size_t count;
+  size_t head;
+  size_t tail;
+  Chunk chunks[];
+} Queue;
+
+void queue_init(Queue *q, size_t capacity) {
+  mtx_init(&q->lock, mtx_plain);
+  cnd_init(&q->empty);
+  cnd_init(&q->full);
+
+  q->capacity = capacity;
+  q->count = 0;
+  q->head = 0;
+  q->tail = 0;
+
+  for (size_t i = 0; i < capacity; i++) {
+    Chunk *c = &q->chunks[i];
+    mtx_init(&c->lock, mtx_plain);
+    cnd_init(&c->done_cnd);
+    chunk_set(c, nullptr, 0);
+  }
+}
+
+void queue_push(Queue *q, char *data, size_t data_len) {
+  mtx_lock(&q->lock);
+  while (q->count == q->capacity) {
+    cnd_wait(&q->full, &q->lock);
+  }
+
+  Chunk *c = &q->chunks[q->tail];
+  chunk_set(c, data, data_len);
+  q->tail = q->tail + 1 < q->capacity ? q->tail + 1 : 0;
+  q->count++;
+
+  mtx_unlock(&q->lock);
+
+  cnd_signal(&q->empty);
+}
+
+Chunk *queue_pop(Queue *q) {
+  mtx_lock(&q->lock);
+  while (q->count == 0) {
+    cnd_wait(&q->empty, &q->lock);
+  }
+
+  Chunk *popped = &q->chunks[q->head];
+  q->head = q->head + 1 < q->capacity ? q->head + 1 : 0;
+  q->count--;
+
+  mtx_unlock(&q->lock);
+
+  cnd_signal(&q->full);
+
+  return popped;
+}
+
+void queue_destroy(Queue *q) {
+  mtx_destroy(&q->lock);
+  cnd_destroy(&q->empty);
+  cnd_destroy(&q->full);
+
+  for (size_t i = 0; i < q->capacity; i++) {
+    Chunk *c = &q->chunks[i];
+    mtx_destroy(&c->lock);
+    cnd_destroy(&c->done_cnd);
+  }
+}
+
+typedef struct {
+  size_t chunk_size;
   char **filepaths;
   size_t count;
-  int fd;
+  char *map_ptr;
+  size_t map_size;
+  size_t map_offset;
 } Reader;
 
-bool reader_init(Reader *r, char **filepaths, size_t count) {
+bool reader_init(Reader *r, char **filepaths, size_t count, size_t chunk_size) {
   for (size_t i = 0; i < count; i++) {
-    int fd = open(filepaths[i], O_RDONLY);
-    if (fd < 0) {
+    if (access(filepaths[i], F_OK) != 0) {
       return false;
     }
-
-    close(fd);
   }
 
   r->filepaths = filepaths;
   r->count = count;
-  r->fd = -1;
+  r->map_ptr = nullptr;
+  r->map_size = 0;
+  r->map_offset = 0;
+  r->chunk_size = chunk_size;
   return true;
 }
 
-size_t reader_read_chunk(Reader *r, char *buf) {
-  size_t total_read = 0;
-
-  while (total_read < CHUNK_SIZE) {
-    if (r->fd < 0) {
-      if (r->count == 0) {
-        break;
-      }
-
-      r->fd = open(r->filepaths[0], O_RDONLY);
-      // posix_fadvise(r->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-      r->filepaths++;
-      r->count--;
+size_t reader_get_chunk(Reader *reader, char **data_ptr) {
+  if (reader->map_ptr == nullptr) {
+    if (reader->count == 0) {
+      return 0;
     }
 
-    ssize_t n = read(r->fd, buf + total_read, CHUNK_SIZE - total_read);
+    int fd = open(reader->filepaths[0], O_RDONLY);
+    reader->filepaths++;
+    reader->count--;
 
-    if (n > 0) {
-      total_read += (size_t)n;
-    } else {
-      close(r->fd);
-      r->fd = -1;
-    }
+    struct stat sb;
+    fstat(fd, &sb);
+    reader->map_size = (size_t)sb.st_size;
+    reader->map_offset = 0;
+
+    reader->map_ptr =
+        mmap(nullptr, reader->map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    madvise(reader->map_ptr, reader->map_size, MADV_SEQUENTIAL);
+    close(fd);
   }
 
-  return total_read;
-}
+  *data_ptr = reader->map_ptr + reader->map_offset;
 
-void chunk_arena_init(ChunkArena *arena, size_t count, Reader *reader) {
-  arena->filling = true;
-  arena->count = count;
+  size_t remaining = reader->map_size - reader->map_offset;
+  size_t read = reader->chunk_size;
 
-  for (size_t i = 0; i < count; i++) {
-    Chunk *chunk = &arena->chunks[i];
-    mtx_init(&chunk->lock, mtx_plain);
-    cnd_init(&chunk->done);
-
-    size_t n = reader_read_chunk(reader, chunk->raw);
-    if (n > 0) {
-      chunk->raw_len = n;
-      chunk->state = CHUNK_READY;
-    } else {
-      chunk->state = CHUNK_EMPTY;
-      arena->filling = false;
-    }
+  if (remaining < reader->chunk_size) {
+    read = remaining;
+    reader->map_ptr = nullptr;
   }
+
+  reader->map_offset += read;
+
+  return read;
 }
 
 void process_chunk(Chunk *chunk) {
-  char *end = chunk->raw + chunk->raw_len;
+  char *end = chunk->data + chunk->data_len;
   Run *runs_ptr = chunk->runs;
   chunk->run_count = 0;
 
-  Run run = {.length = 1, .character = *chunk->raw};
-  for (char *current_ptr = chunk->raw + 1; current_ptr < end; current_ptr++) {
+  Run run = {.length = 1, .character = *chunk->data};
+  for (char *current_ptr = chunk->data + 1; current_ptr < end; current_ptr++) {
     char current_char = *current_ptr;
     if (current_char == run.character) {
       run.length++;
@@ -138,76 +197,68 @@ void process_chunk(Chunk *chunk) {
   chunk->run_count++;
 }
 
-int worker(void *a) {
-  ChunkArena *arena = (ChunkArena *)a;
-  size_t used_chunks = 0;
-  size_t i = 0;
+int worker(void *q) {
+  Queue *queue = (Queue *)q;
+  Chunk *chunk = nullptr;
   while (true) {
-    Chunk *chunk = &arena->chunks[i];
-    ChunkState expected = CHUNK_READY;
-    bool available =
-        atomic_compare_exchange_strong(&chunk->state, &expected, CHUNK_WORKING);
-    if (available) {
-      used_chunks = 0;
-
-      process_chunk(chunk);
-      chunk->state = CHUNK_DONE;
-      mtx_lock(&chunk->lock);
-
-      cnd_broadcast(&chunk->done);
-      mtx_unlock(&chunk->lock);
-    } else {
-      used_chunks++;
-      if (used_chunks == arena->count) {
-        if (!arena->filling) {
-          return 0;
-        }
-
-        used_chunks = 0;
-        thrd_yield();
-      }
+    chunk = queue_pop(queue);
+    if (chunk->data == nullptr) {
+      return 0;
     }
 
-    i = i + 1 < arena->count ? i + 1 : 0;
+    process_chunk(chunk);
+    mtx_lock(&chunk->lock);
+    chunk->done = true;
+    cnd_signal(&chunk->done_cnd);
+    mtx_unlock(&chunk->lock);
   }
 }
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     fprintf(stderr, "pzip: file1 [file2 ...]\n");
-    return 1;
+    return EXIT_FAILURE;
   }
 
   size_t thread_count = (size_t)get_nprocs();
   size_t chunk_count = CHUNK_FACTOR * thread_count;
   Reader reader;
-  if (!reader_init(&reader, &argv[1], (size_t)(argc - 1))) {
+  if (!reader_init(&reader, &argv[1], (size_t)(argc - 1), CHUNK_SIZE)) {
     fprintf(stderr, "pzip: cannot open file\n");
-    return 1;
+    return EXIT_FAILURE;
   };
 
-  ChunkArena *chunk_arena =
-      mmap(NULL, sizeof(ChunkArena) + (chunk_count * sizeof(Chunk)),
+  Queue *queue =
+      mmap(nullptr, sizeof(Queue) + (chunk_count * sizeof(Chunk)),
            PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  chunk_arena_init(chunk_arena, chunk_count, &reader);
+
+  queue_init(queue, chunk_count);
+  size_t remaining_chunks = 0;
+  for (size_t i = 0; i < chunk_count; i++) {
+    char *chunk = nullptr;
+    size_t read = reader_get_chunk(&reader, &chunk);
+    if (read == 0) {
+      break;
+    }
+
+    remaining_chunks++;
+    queue_push(queue, chunk, read);
+  }
 
   thrd_t threads[thread_count];
   for (size_t i = 0; i < thread_count; i++) {
-    thrd_create(&threads[i], worker, chunk_arena);
+    thrd_create(&threads[i], worker, queue);
   }
 
   Run last_run = {};
   bool first_chunk = true;
   size_t i = 0;
-  while (true) {
-    Chunk *chunk = &chunk_arena->chunks[i];
-    if (chunk->state == CHUNK_EMPTY) {
-      break;
-    }
+  while (remaining_chunks > 0) {
+    Chunk *chunk = &queue->chunks[i];
 
     mtx_lock(&chunk->lock);
-    while (chunk->state != CHUNK_DONE) {
-      cnd_wait(&chunk->done, &chunk->lock);
+    while (!chunk->done) {
+      cnd_wait(&chunk->done_cnd, &chunk->lock);
     }
     mtx_unlock(&chunk->lock);
 
@@ -226,23 +277,20 @@ int main(int argc, char *argv[]) {
 
     first_chunk = false;
     memcpy(&last_run, &chunk->runs[chunk->run_count - 1], sizeof(Run));
-    if (chunk_arena->filling) {
-      size_t n = reader_read_chunk(&reader, chunk->raw);
-      if (n == 0) {
-        chunk->state = CHUNK_EMPTY;
-      } else {
-        chunk->raw_len = n;
-        chunk->state = CHUNK_READY;
-      }
+    if (remaining_chunks == chunk_count) {
+      char *data = nullptr;
+      size_t len = reader_get_chunk(&reader, &data);
 
-      if (n < CHUNK_SIZE) {
-        chunk_arena->filling = false;
+      if (len == 0) {
+        remaining_chunks--;
+      } else {
+        queue_push(queue, data, len);
       }
     } else {
-      chunk->state = CHUNK_EMPTY;
+      remaining_chunks--;
     }
 
-    i = i + 1 < chunk_arena->count ? i + 1 : 0;
+    i = i + 1 < chunk_count ? i + 1 : 0;
   }
 
   if (!first_chunk) {
@@ -250,8 +298,13 @@ int main(int argc, char *argv[]) {
   }
 
   for (size_t t = 0; t < thread_count; t++) {
-    thrd_join(threads[t], NULL);
+    queue_push(queue, nullptr, 0);
   }
 
-  munmap(chunk_arena, sizeof(ChunkArena) + (chunk_count * sizeof(Chunk)));
+  for (size_t t = 0; t < thread_count; t++) {
+    thrd_join(threads[t], nullptr);
+  }
+
+  queue_destroy(queue);
+  munmap(queue, sizeof(Queue) + (chunk_count * sizeof(Chunk)));
 }

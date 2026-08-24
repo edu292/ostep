@@ -1,2 +1,2 @@
 #!/bin/env bash
-../tester/run-tests.sh
+exec ../tester/run-tests.sh "$@"
