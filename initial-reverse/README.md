@@ -1,4 +1,3 @@
-
 # Introduction
 
 **Before beginning:** Read this [lab tutorial](http://pages.cs.wisc.edu/~remzi/OSTEP/lab-tutorial.pdf); it has some useful tips for programming in the C environment.
@@ -143,4 +142,3 @@ a simple version of `reverse.c` working (say, that just reads in the file);
 type `cp reverse.c reverse.v1.c` to make a copy into the file
 `reverse.v1.c`. More sophisticated developers use version control systems git
 (perhaps through github); such a tool is well worth learning, so do it!
-
