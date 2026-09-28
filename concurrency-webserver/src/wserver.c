@@ -6,78 +6,131 @@
 #include <string.h>
 #include <threads.h>
 
+typedef enum { POLICY_FIFO, POLICY_SFF } Policy;
+
 typedef struct {
-  cnd_t empty;
-  cnd_t full;
+  cnd_t not_empty;
+  cnd_t not_full;
   mtx_t lock;
   size_t capacity;
   size_t count;
-  size_t head;
-  size_t tail;
-  int data[];
-} Queue;
+  Policy policy;
+  Request **data;
+} PriorityQueue;
 
-void queue_init(Queue *q, size_t capacity) {
-  mtx_init(&q->lock, mtx_plain);
-  cnd_init(&q->empty);
-  cnd_init(&q->full);
+void queue_init(PriorityQueue *pq, size_t capacity, Policy policy) {
+  mtx_init(&pq->lock, mtx_plain);
+  cnd_init(&pq->not_empty);
+  cnd_init(&pq->not_full);
+  pq->data = malloc(capacity * sizeof(char *));
 
-  q->capacity = capacity;
-  q->count = 0;
-  q->head = 0;
-  q->tail = 0;
+  pq->policy = policy;
+  pq->capacity = capacity;
+  pq->count = 0;
 }
 
-void queue_push(Queue *q, int val) {
-  mtx_lock(&q->lock);
-  while (q->count == q->capacity) {
-    cnd_wait(&q->full, &q->lock);
+void queue_push(PriorityQueue *pq, Request *val) {
+  mtx_lock(&pq->lock);
+  while (pq->count == pq->capacity) {
+    cnd_wait(&pq->not_full, &pq->lock);
   }
 
-  q->data[q->tail] = val;
-  q->tail = q->tail + 1 < q->capacity ? q->tail + 1 : 0;
-  q->count++;
+  switch (pq->policy) {
+  case POLICY_FIFO:
+    pq->data[pq->count] = val;
+    break;
+  case POLICY_SFF:
+    size_t index = pq->count;
+    long insert_file_size = val->sbuf.st_size;
+    while (index > 0) {
+      size_t parent_index = (index - 1) / 2;
+      Request *parent = pq->data[parent_index];
+      if (parent->sbuf.st_size < insert_file_size) {
+        break;
+      }
 
-  mtx_unlock(&q->lock);
+      pq->data[index] = parent;
+      index = parent_index;
+    }
+    pq->data[index] = val;
+    break;
+  }
 
-  cnd_signal(&q->empty);
+  pq->count++;
+
+  mtx_unlock(&pq->lock);
+
+  cnd_signal(&pq->not_empty);
 }
 
-int queue_pop(Queue *q) {
-  mtx_lock(&q->lock);
-  while (q->count == 0) {
-    cnd_wait(&q->empty, &q->lock);
+Request *queue_pop(PriorityQueue *pq) {
+  mtx_lock(&pq->lock);
+  while (pq->count == 0) {
+    cnd_wait(&pq->not_empty, &pq->lock);
   }
 
-  int popped = q->data[q->head];
-  q->head = q->head + 1 < q->capacity ? q->head + 1 : 0;
-  q->count--;
+  Request *popped = pq->data[0];
+  pq->count--;
+  switch (pq->policy) {
+  case POLICY_FIFO:
+    memmove(&pq->data[0], &pq->data[1], pq->count * sizeof(Request *));
+    break;
+  case POLICY_SFF:
+    pq->data[0] = pq->data[pq->count];
+    size_t index = 0;
 
-  mtx_unlock(&q->lock);
+    while (1) {
+      size_t left = (2 * index) + 1;
+      size_t right = (2 * index) + 2;
+      size_t smallest = index;
 
-  cnd_signal(&q->full);
+      if (left < pq->count &&
+          pq->data[left]->sbuf.st_size < pq->data[smallest]->sbuf.st_size) {
+        smallest = left;
+      }
+
+      if (right < pq->count &&
+          pq->data[right]->sbuf.st_size < pq->data[smallest]->sbuf.st_size) {
+        smallest = right;
+      }
+
+      if (smallest == index) {
+        break;
+      }
+
+      Request *tmp = pq->data[index];
+      pq->data[index] = pq->data[smallest];
+      pq->data[smallest] = tmp;
+
+      index = smallest;
+    }
+  }
+
+  mtx_unlock(&pq->lock);
+
+  cnd_signal(&pq->not_full);
 
   return popped;
 }
 
-void queue_destroy(Queue *q) {
-  mtx_destroy(&q->lock);
-  cnd_destroy(&q->empty);
-  cnd_destroy(&q->full);
+void queue_destroy(PriorityQueue *pq) {
+  mtx_destroy(&pq->lock);
+  cnd_destroy(&pq->not_empty);
+  cnd_destroy(&pq->not_full);
 }
 
 int worker(void *q) {
-  Queue *queue = (Queue *)q;
-  int conn_fd;
-  while ((conn_fd = queue_pop(queue)) != -1) {
-    request_handle(conn_fd);
-    close_or_die(conn_fd);
+  PriorityQueue *queue = (PriorityQueue *)q;
+  Request *request;
+  while ((request = queue_pop(queue)) != nullptr) {
+    request_handle(request);
+    close_or_die(request->conn_fd);
+    free(request);
   }
 
   return 0;
 }
 
-typedef enum { SCHED_FIFO, SCHED_SFF } SCHED_ALG;
 char default_root[] = ".";
 
 //
@@ -90,7 +143,7 @@ int main(int argc, char *argv[]) {
   int port = 10000;
   int threads = 1;
   int buffers = 1;
-  [[maybe_unused]] SCHED_ALG schedalg = SCHED_FIFO;
+  Policy schedalg = POLICY_FIFO;
 
   while ((c = getopt(argc, argv, "d:p:t:b:s:")) != -1) {
     switch (c) {
@@ -108,9 +161,9 @@ int main(int argc, char *argv[]) {
       break;
     case 's':
       if (strcmp(optarg, "FIFO") == 0) {
-        schedalg = SCHED_FIFO;
+        schedalg = POLICY_FIFO;
       } else if (strcmp(optarg, "SFF") == 0) {
-        schedalg = SCHED_SFF;
+        schedalg = POLICY_SFF;
       } else {
         fprintf(stderr, "Invalid Scheduling Algorithm. Options: FIFO, SFF\n");
         return EXIT_FAILURE;
@@ -126,8 +179,8 @@ int main(int argc, char *argv[]) {
   // run out of this directory
   chdir_or_die(root_dir);
 
-  Queue queue;
-  queue_init(&queue, (size_t)buffers);
+  PriorityQueue queue;
+  queue_init(&queue, (size_t)buffers, schedalg);
 
   thrd_t workers[threads];
   for (int i = 0; i < threads; i++) {
@@ -141,7 +194,11 @@ int main(int argc, char *argv[]) {
     int client_len = sizeof(client_addr);
     int conn_fd = accept_or_die(listen_fd, (sockaddr_t *)&client_addr,
                                 (socklen_t *)&client_len);
-    queue_push(&queue, conn_fd);
+    Request *request = malloc(sizeof(Request));
+    if (request_parse(conn_fd, request)) {
+      queue_push(&queue, request);
+    }
   }
+  queue_destroy(&queue);
   return 0;
 }
