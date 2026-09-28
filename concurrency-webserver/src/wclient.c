@@ -20,6 +20,15 @@
 //
 
 #include "io_helper.h"
+#include <stdlib.h>
+#include <string.h>
+#include <threads.h>
+
+typedef struct {
+  char *host;
+  int port;
+  char *filename;
+} Context;
 
 #define MAXBUF (8192)
 
@@ -66,27 +75,37 @@ void client_print(int fd) {
   }
 }
 
-int main(int argc, char *argv[]) {
-  char *host, *filename;
-  int port;
-  int clientfd;
+int worker(void *v) {
+  Context *context = (Context *)v;
+  int clientfd = open_client_fd_or_die(context->host, context->port);
 
-  if (argc != 4) {
-    fprintf(stderr, "Usage: %s <host> <port> <filename>\n", argv[0]);
-    exit(1);
-  }
-
-  host = argv[1];
-  port = atoi(argv[2]);
-  filename = argv[3];
-
-  /* Open a single connection to the specified host and port */
-  clientfd = open_client_fd_or_die(host, port);
-
-  client_send(clientfd, filename);
+  client_send(clientfd, context->filename);
   client_print(clientfd);
 
   close_or_die(clientfd);
+  return 1;
+}
+
+int main(int argc, char *argv[]) {
+  if (argc < 4) {
+    fprintf(stderr, "Usage: %s <host> <port> <filename>...\n", argv[0]);
+    exit(1);
+  }
+
+  Context context = {.host = argv[1], .port = atoi(argv[2])};
+  int file_count = argc - 3;
+  thrd_t threads[file_count];
+
+  for (int i = 0; i < file_count; i++) {
+    Context *worker_context = malloc(sizeof(Context));
+    memcpy(worker_context, &context, sizeof(Context));
+    worker_context->filename = argv[i + 3];
+    thrd_create(&threads[i], worker, worker_context);
+  }
+
+  for (int i = 0; i < file_count; i++) {
+    thrd_join(threads[i], nullptr);
+  }
 
   exit(0);
 }
