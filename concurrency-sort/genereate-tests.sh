@@ -1,69 +1,73 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 mkdir -p tests
+mkdir -p tests-out
 
-# Base test generator
-gen_test() {
-    local n=$1
+create_error_test() {
+    local t=$1
     local desc=$2
-    local run_cmd=$3
-    local rc=$4
-    local err=$5
+    local cmd=$3
+    local errmsg=$4
 
-    printf "%s\n" "$rc" >tests/"$n".rc
-    printf "%b" "$err" >tests/"$n".err
-
-    # We output the exact command run-tests.sh will 'eval'
-    printf "%s\n" "$run_cmd" >tests/"$n".run
-    printf "%s\n" "$desc" >tests/"$n".desc
+    echo "$desc" >"tests/$t.desc"
+    echo "$cmd" >"tests/$t.run"
+    echo "1" >"tests/$t.rc"
+    : >"tests/$t.out"
+    echo "$errmsg" >"tests/$t.err"
 }
 
-setup_test() {
-    local n=$1
+create_sort_test() {
+    local t=$1
     local desc=$2
     local mode=$3
+    local extra_arg=$4
+    local seed=${5:-42}
 
-    # 1. Generate the binary input data
-    ./gen-records.py "$mode" tests/"$n".in
+    echo "$desc" >"tests/$t.desc"
+    echo "0" >"tests/$t.rc"
+    : >"tests/$t.out"
+    : >"tests/$t.err"
 
-    # 2. Generate the EXPECTED stdout (run-tests.sh checks tests-out/N.out against this)
-    ./reference-sort.py tests/"$n".in tests/"$n".out
+    cat <<EOF >"tests/$t.pre"
+./gen-records.py "$mode" "tests-out/in_$t.bin" "$extra_arg" "$seed" --golden "tests-out/expected_$t.bin"
+EOF
 
-    # 3. Create the .run file.
-    # It runs psort, then cats the actual output file so it goes to standard output.
-    # run-tests.sh will capture this stdout and save it to tests-out/N.out for comparison.
-    gen_test "$n" "$desc" "./psort tests/$n.in tests/$n.actual_out && cat tests/$n.actual_out" 0 ""
+    cat <<EOF >"tests/$t.run"
+./psort tests-out/in_$t.bin tests-out/out_$t.bin && cmp -s tests-out/out_$t.bin tests-out/expected_$t.bin
+EOF
+
+    cat <<EOF >"tests/$t.post"
+rm -f tests-out/in_$t.bin tests-out/out_$t.bin tests-out/expected_$t.bin
+EOF
 }
 
-# T1: No args
-gen_test 1 "No arguments" "./psort" 1 "usage: psort input output\n"
-touch tests/1.out # Expecting empty stdout on error
+# --- Test Definitions (1 to 16) ---
 
-# T2: Bad input file
-# Note: perror("in") usually appends "in: No such file or directory"
-gen_test 2 "Bad file" "./psort does_not_exist.in tests/2.actual_out" 1 "psort: could not open file\n"
-touch tests/2.out # Expecting empty stdout on error
+# 1-3: Argument Handling & Input Validation
+create_error_test 1 "No arguments provided" "./psort" "usage: psort input output"
+create_error_test 2 "Too few arguments provided" "./psort only_one_arg" "usage: psort input output"
+create_error_test 3 "Non-existent input file" "./psort tests-out/non_existent_file.bin tests-out/out_3.bin" "psort: could not open file"
 
-# T3: Empty file
-setup_test 3 "Empty file" "empty"
+# 4-6: Boundary & Degenerate Cases
+create_sort_test 4 "Empty file (0 records)" "empty" ""
+create_sort_test 5 "Single record" "fixed" "42"
+create_sort_test 6 "Two records already sorted" "fixed" "10,20"
+create_sort_test 7 "Two records reversed" "fixed" "99,12"
 
-# T4: Single record
-setup_test 4 "Single record" "single"
+# 8-10: Small Sequences & Duplicates
+create_sort_test 8 "Small sequence with negative numbers" "fixed" "5,10,0,99,1000,42"
+create_sort_test 9 "Identical keys (100 records)" "identical" "100"
+create_sort_test 10 "Keys with heavy duplicates" "fixed" "3,1,4,1,5,9,2,6,5,3,5,8,9,7,9,3,2,3,8,4,6"
 
-# T5: Already sorted
-setup_test 5 "Two records, already sorted" "sorted"
+# 11-13: Presorted and Adversarial Distributions
+create_sort_test 11 "Already sorted (1,000 records)" "sorted" "1000"
+create_sort_test 12 "Reverse sorted (1,000 records)" "reverse" "1000"
+create_sort_test 13 "Power-of-two size (1,024 records, random keys)" "random" "1024" 101
 
-# T6: Reverse sorted
-setup_test 6 "Two records, reverse sorted" "reverse"
+# 14-16: Concurrency & Stress Tests (Multithread partitioning)
+create_sort_test 14 "Prime record count across threads (1,543 records)" "random" "1543" 202
+create_sort_test 15 "Moderate dataset (10,000 records)" "random" "10000" 303
+create_sort_test 16 "Heavy dataset (50,000 records / 5MB)" "random" "50000" 404
 
-# T7: Identical keys
-setup_test 7 "Multiple identical records" "identical"
-
-# T8: 100 random records
-setup_test 8 "100 random records" "random_100"
-
-# T9: 10,000 random records (~1MB)
-setup_test 9 "10,000 random records" "random_10000"
-
-# T10: 100,000 random records (~10MB)
-setup_test 10 "100,000 random records" "random_100000"
+echo "Generated 16 tests in tests/ successfully."

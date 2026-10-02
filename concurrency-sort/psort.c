@@ -1,11 +1,13 @@
-#include <dlfcn.h>
 #include <fcntl.h>
-#include <stddef.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
+#include <threads.h>
 #include <unistd.h>
 
 typedef struct {
@@ -13,52 +15,91 @@ typedef struct {
   char data[96];
 } Record;
 
-void quicksort_(size_t low, size_t high, Record array[]) {
-  if (high <= low) {
-    return;
+typedef struct {
+  uint32_t key;
+  uint32_t index;
+} KeyIndex;
+
+typedef struct {
+  pthread_barrier_t *barrier;
+  size_t thread_id;
+  size_t thread_count;
+
+  KeyIndex *keys[2];
+
+  uint32_t *hist_table;
+
+  size_t start;
+  size_t end;
+
+  const Record *in_records;
+  Record *out_records;
+} Context;
+
+constexpr size_t KEY_BITS = sizeof(uint32_t) * 8;
+constexpr size_t RADIX_BITS = 8;
+
+constexpr size_t RADIX_BUCKETS = 1ULL << RADIX_BITS;
+constexpr size_t RADIX_MASK = RADIX_BUCKETS - 1;
+
+constexpr size_t NUM_PASSES = (KEY_BITS + RADIX_BITS - 1) / RADIX_BITS;
+
+int worker(void *v) {
+  Context *ctx = (Context *)v;
+  const Record *in_records = ctx->in_records;
+
+  KeyIndex *src = ctx->keys[0];
+  KeyIndex *dst = ctx->keys[1];
+  for (size_t i = ctx->start; i < ctx->end; i++) {
+    src[i].key = in_records[i].key;
+    src[i].index = (uint32_t)i;
   }
 
-  size_t mid_idx = low + ((high - low) / 2);
-  uint32_t first = array[low].key;
-  uint32_t mid = array[mid_idx].key;
-  uint32_t last = array[high].key;
+  uint32_t *my_hist = &ctx->hist_table[ctx->thread_id * RADIX_BUCKETS];
+  for (size_t pass = 0; pass < NUM_PASSES; pass++) {
+    memset(my_hist, 0, RADIX_BUCKETS * sizeof(uint32_t));
+    for (size_t i = ctx->start; i < ctx->end; i++) {
+      uint32_t bucket = (src[i].key >> (pass * RADIX_BITS)) & RADIX_MASK;
+      my_hist[bucket]++;
+    }
 
-  uint32_t pivot = mid;
-  if ((first <= last && first >= mid) || (first >= last && first <= mid)) {
-    pivot = first;
-  } else if ((last <= first && last >= mid) || (last >= first && last <= mid)) {
-    pivot = last;
+    pthread_barrier_wait(ctx->barrier);
+
+    if (ctx->thread_id == 0) {
+      uint32_t offset = 0;
+      for (size_t b = 0; b < RADIX_BUCKETS; b++) {
+        for (size_t t = 0; t < ctx->thread_count; t++) {
+          size_t cell = (t * RADIX_BUCKETS) + b;
+          uint32_t count = ctx->hist_table[cell];
+          ctx->hist_table[cell] = offset;
+          offset += count;
+        }
+      }
+    }
+
+    pthread_barrier_wait(ctx->barrier);
+
+    for (size_t i = ctx->start; i < ctx->end; i++) {
+      KeyIndex item = src[i];
+      uint32_t bucket = (item.key >> (pass * RADIX_BITS)) & RADIX_MASK;
+      uint32_t index = my_hist[bucket]++;
+      dst[index] = item;
+    }
+
+    pthread_barrier_wait(ctx->barrier);
+
+    KeyIndex *temp = src;
+    src = dst;
+    dst = temp;
   }
 
-  size_t i = low;
-  size_t j = high;
-  while (true) {
-    while (array[i].key < pivot) {
-      i++;
-    }
-
-    while (array[j].key > pivot) {
-      j--;
-    }
-
-    if (i >= j) {
-      break;
-    }
-
-    Record temp = array[i];
-    array[i] = array[j];
-    array[j] = temp;
-
-    i++;
-    j--;
+  Record *out_records = ctx->out_records;
+  for (size_t i = ctx->start; i < ctx->end; i++) {
+    uint32_t src_idx = src[i].index;
+    out_records[i] = in_records[src_idx];
   }
 
-  quicksort_(low, j, array);
-  quicksort_(j + 1, high, array);
-}
-
-void quicksort(size_t count, Record array[count]) {
-  quicksort_(0, count - 1, array);
+  return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
@@ -67,46 +108,121 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  char *in_filename = argv[1];
-  int in_fd = open(in_filename, O_RDONLY);
+  int in_fd = open(argv[1], O_RDONLY);
   if (in_fd < 0) {
     fprintf(stderr, "psort: could not open file\n");
     return EXIT_FAILURE;
   }
 
-  char *out_filename = argv[2];
-  int out_fd = open(out_filename, O_WRONLY | O_TRUNC | O_CREAT, 0644);
-  if (out_fd < 0) {
-    fprintf(stderr, "psort: could not open file\n");
+  struct stat st;
+  if (fstat(in_fd, &st) != 0) {
+    fprintf(stderr, "psort: could not stat input file\n");
+    close(in_fd);
     return EXIT_FAILURE;
   }
 
-  struct stat st;
-  fstat(in_fd, &st);
-  size_t data_size = (size_t)st.st_size;
-  if (data_size == 0) {
+  size_t total_bytes = (size_t)st.st_size;
+  if (total_bytes % sizeof(Record) != 0) {
+    fprintf(stderr, "psort: invalid input file size\n");
     close(in_fd);
+    return EXIT_FAILURE;
+  }
+  size_t num_records = total_bytes / sizeof(Record);
+
+  int out_fd = open(argv[2], O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (out_fd < 0) {
+    fprintf(stderr, "psort: could not open file\n");
+    close(in_fd);
+    return EXIT_FAILURE;
+  }
+
+  if (total_bytes == 0) {
     close(out_fd);
+    close(in_fd);
     return EXIT_SUCCESS;
   }
 
-  Record *data = mmap(nullptr, data_size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (data == MAP_FAILED) {
-    perror("mmap failed");
+  Record *in_records = mmap(NULL, total_bytes, PROT_READ, MAP_SHARED, in_fd, 0);
+  if (in_records == MAP_FAILED) {
+    perror("in mmap failed");
     return EXIT_FAILURE;
   }
-  read(in_fd, data, data_size);
 
   close(in_fd);
-  madvise(data, data_size, MADV_SEQUENTIAL);
 
-  size_t record_count = data_size / sizeof(Record);
-  quicksort(record_count, data);
+  if (posix_fallocate(out_fd, 0, total_bytes) != 0) {
+    perror("posix_fallocate failed");
+    return EXIT_FAILURE;
+  }
 
-  write(out_fd, data, data_size);
+  Record *out_records =
+      mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
+  if (out_records == MAP_FAILED) {
+    perror("out mmap failed");
+    return EXIT_FAILURE;
+  }
+
   close(out_fd);
-  munmap(data, data_size);
+  madvise(in_records, total_bytes, MADV_WILLNEED | MADV_SEQUENTIAL);
+  madvise(out_records, total_bytes, MADV_WILLNEED | MADV_SEQUENTIAL);
 
+  size_t thread_count = (size_t)get_nprocs();
+  if (thread_count > num_records) {
+    thread_count = num_records;
+  }
+
+  thrd_t workers[thread_count];
+  size_t sz_barrier = sizeof(pthread_barrier_t);
+  size_t sz_contexts = thread_count * sizeof(Context);
+  size_t sz_keys = num_records * sizeof(KeyIndex);
+  size_t sz_hist_table = thread_count * RADIX_BUCKETS * sizeof(uint32_t);
+
+  char *arena =
+      malloc(sz_barrier + sz_contexts + (2 * sz_keys) + sz_hist_table);
+
+  char *ptr = arena;
+  pthread_barrier_t *barrier = (pthread_barrier_t *)ptr;
+  pthread_barrier_init(barrier, nullptr, thread_count);
+  ptr += sz_barrier;
+  Context *contexts = (Context *)ptr;
+  ptr += sz_contexts;
+  KeyIndex *keys0 = (KeyIndex *)ptr;
+  ptr += sz_keys;
+  KeyIndex *keys1 = (KeyIndex *)ptr;
+  ptr += sz_keys;
+  uint32_t *hist_table = (uint32_t *)ptr;
+
+  size_t chunk_size = num_records / thread_count;
+  size_t remainder = num_records % thread_count;
+  size_t current = 0;
+  for (size_t i = 0; i < thread_count; i++) {
+    Context *ctx = &contexts[i];
+    size_t count = chunk_size + (i < remainder ? 1 : 0);
+    ctx->start = current;
+    current += count;
+    ctx->end = current;
+
+    ctx->thread_id = i;
+    ctx->thread_count = thread_count;
+    ctx->barrier = barrier;
+
+    ctx->keys[0] = keys0;
+    ctx->keys[1] = keys1;
+    ctx->hist_table = hist_table;
+
+    ctx->in_records = in_records;
+    ctx->out_records = out_records;
+
+    thrd_create(&workers[i], worker, ctx);
+  }
+
+  for (size_t i = 0; i < thread_count; i++) {
+    thrd_join(workers[i], nullptr);
+  }
+
+  munmap(out_records, total_bytes);
+  munmap(in_records, total_bytes);
+  pthread_barrier_destroy(barrier);
+  free(arena);
   return EXIT_SUCCESS;
 }

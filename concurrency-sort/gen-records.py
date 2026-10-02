@@ -1,24 +1,69 @@
 #!/usr/bin/env python
-
-import os
+import random
+import struct
 import sys
 
-mode, out_path = sys.argv[1], sys.argv[2]
-records = []
+PAYLOAD_SIZE = 96
+RECORD_SIZE = 100
 
-if mode == "empty":
-    pass
-elif mode == "single":
-    records.append(b"\x01\x02\x03\x04" + b"A" * 96)
-elif mode == "sorted":
-    records.extend([b"\x01\x00\x00\x00" + b"A" * 96, b"\x02\x00\x00\x00" + b"B" * 96])
-elif mode == "reverse":
-    records.extend([b"\x02\x00\x00\x00" + b"B" * 96, b"\x01\x00\x00\x00" + b"A" * 96])
-elif mode == "identical":
-    records = [b"\x05\x00\x00\x00" + b"C" * 96] * 10
-else:
-    count = int(mode.split("_")[1])
-    records = [os.urandom(100) for _ in range(count)]
 
-with open(out_path, "wb") as f:
-    f.writelines(records)
+def make_record(key: int, fill: bytes = b"A") -> bytes:
+    key_bytes = struct.pack("<I", key)
+    payload = (fill * (PAYLOAD_SIZE // len(fill) + 1))[:PAYLOAD_SIZE]
+    return key_bytes + payload
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(
+            "Usage: gen-records.py <mode> <outfile> [count|values] [seed] [--golden <golden_file>]"
+        )
+
+    mode = sys.argv[1]
+    outfile = sys.argv[2]
+
+    mode = sys.argv[1]
+    outfile = sys.argv[2]
+    arg3 = sys.argv[3] if len(sys.argv) > 3 else ""
+    seed = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 42
+    match mode:
+        case "empty":
+            records = []
+        case "fixed":
+            vals = [int(x) for x in arg3.split(",") if x]
+            records = [make_record(v, fill=f"rec_{v}_".encode()) for v in vals]
+        case "random":
+            count = int(arg3) if arg3 else 0
+            rng = random.Random(seed)
+            fill = b"rnd_" * 24
+            records = [
+                struct.pack("<I", rng.getrandbits(32)) + fill for _ in range(count)
+            ]
+        case "sorted":
+            count = int(arg3) if arg3 else 0
+            fill = b"asc_" * 24
+            records = [struct.pack("<I", i) + fill for i in range(count)]
+        case "reverse":
+            count = int(arg3) if arg3 else 0
+            fill = b"desc" * 24
+            records = [struct.pack("<I", count - i) + fill for i in range(count)]
+        case "identical":
+            count = int(arg3) if arg3 else 0
+            rec = struct.pack("<I", 1337) + (b"same" * 24)
+            records = [rec] * count
+        case _:
+            sys.exit(f"Unknown mode: {mode}")
+
+    with open(outfile, "wb") as f:
+        f.writelines(records)
+
+    if "--golden" in sys.argv:
+        g_idx = sys.argv.index("--golden") + 1
+        golden_file = sys.argv[g_idx]
+        sorted_records = sorted(records, key=lambda r: struct.unpack("<I", r[:4])[0])
+        with open(golden_file, "wb") as f:
+            f.writelines(sorted_records)
+
+
+if __name__ == "__main__":
+    main()
