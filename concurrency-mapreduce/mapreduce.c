@@ -1,74 +1,11 @@
 #include "mapreduce.h"
+#include "queue.h"
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
-
-#define DEFINE_QUEUE(T, name)                                                  \
-  typedef struct name {                                                        \
-    T *data;                                                                   \
-    size_t head;                                                               \
-    size_t tail;                                                               \
-    size_t capacity;                                                           \
-  } name;                                                                      \
-                                                                               \
-  static inline bool name##_init(name *q, size_t capacity) {                   \
-    q->capacity = capacity > 0 ? capacity : 128;                               \
-    q->head = 0;                                                               \
-    q->tail = 0;                                                               \
-    q->data = (T *)malloc(q->capacity * sizeof(T));                            \
-    return q->data != nullptr;                                                 \
-  }                                                                            \
-                                                                               \
-  static inline void name##_destroy(name *q) {                                 \
-    free(q->data);                                                             \
-    q->data = nullptr;                                                         \
-    q->head = 0;                                                               \
-    q->tail = 0;                                                               \
-    q->capacity = 0;                                                           \
-  }                                                                            \
-                                                                               \
-  static inline bool name##_grow(name *q) {                                    \
-    size_t new_cap = q->capacity * 2;                                          \
-    T *new_data = (T *)realloc(q->data, new_cap * sizeof(T));                  \
-    if (!new_data) {                                                           \
-      return false;                                                            \
-    }                                                                          \
-                                                                               \
-    q->data = new_data;                                                        \
-    q->capacity = new_cap;                                                     \
-    return true;                                                               \
-  }                                                                            \
-                                                                               \
-  static inline bool name##_push(name *q, T value) {                           \
-    if (q->tail == q->capacity && !name##_grow(q)) {                           \
-      return false;                                                            \
-    }                                                                          \
-                                                                               \
-    q->data[q->tail++] = value;                                                \
-    return true;                                                               \
-  }                                                                            \
-                                                                               \
-  static inline bool name##_pop(name *q, T *out) {                             \
-    if (q->head == q->tail) {                                                  \
-      return false;                                                            \
-    }                                                                          \
-                                                                               \
-    *out = q->data[q->head++];                                                 \
-    return true;                                                               \
-  }                                                                            \
-                                                                               \
-  static inline size_t name##_count(const name *q) {                           \
-    return q->tail - q->head;                                                  \
-  }                                                                            \
-                                                                               \
-  static inline T *name##_expand(name *q) {                                    \
-    if (q->tail == q->capacity && !name##_grow(q))                             \
-      return nullptr;                                                          \
-    return &q->data[q->tail++];                                                \
-  }
 
 typedef struct {
   char *key;
@@ -155,6 +92,24 @@ static inline void StrQueue_destroy_elements(StrQueue *q) {
 
 DEFINE_QUEUE(StrQueue, StrBuckets)
 
+static inline StrQueue *StrBuckets_expand(StrBuckets *q) {
+  if (q->tail == q->capacity && !StrBuckets_grow(q)) {
+    return nullptr;
+  }
+
+  return &q->data[q->tail++];
+}
+
+unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
+  unsigned long hash = 5381;
+  int c;
+  while ((c = *key++) != '\0') {
+    hash = (hash * 33) + c;
+  }
+
+  return hash % num_partitions;
+}
+
 typedef struct {
   mtx_t lock;
   StrBuckets buckets;
@@ -229,16 +184,6 @@ void MR_Emit(char *key, char *value) {
 
   StrQueue_push(values, strdup(value));
   mtx_unlock(&p->lock);
-}
-
-unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
-  unsigned long hash = 5381;
-  int c;
-  while ((c = *key++) != '\0') {
-    hash = (hash * 33) + c;
-  }
-
-  return hash % num_partitions;
 }
 
 char *get_next(char *key, int partition_number) {
